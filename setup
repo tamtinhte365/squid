@@ -1,0 +1,76 @@
+1. Cập nhật CentOS
+sudo yum update && sudo yum upgrade
+
+2. Khởi động lại VPS cho chắc
+reboot
+
+3. Cài Squid vào đi mày
+sudo yum install squid
+
+4. Cài httpd-tools mà tạo user với pass cho proxy
+sudo yum install httpd-tools
+
+sudo touch /etc/squid/squid_passwd
+
+sudo chown squid /etc/squid/squid_passwd
+
+5. Tạo User và pass
+sudo htpasswd /etc/squid/squid_passwd tamtinhte
+sau đó nhập pass 2 lần, hiện Adding password for user tamtinhte là ok
+
+6. Chỉnh sửa file cấu hình
+nano /etc/squid/squid.conf
+
+7. Copy đoạn sau đây vào ngay đầu file
+Ngay sau đoạn
+#
+# Recommended minimum configuration:
+# 
+
+auth_param basic program /usr/lib64/squid/basic_ncsa_auth /etc/squid/squid_passwd
+acl ncsa_users proxy_auth REQUIRED
+http_access allow ncsa_users
+forwarded_for off
+request_header_access Allow allow all
+request_header_access Authorization allow all
+request_header_access WWW-Authenticate allow all
+request_header_access Proxy-Authorization allow all
+request_header_access Proxy-Authenticate allow all
+request_header_access Cache-Control allow all
+request_header_access Content-Encoding allow all
+request_header_access Content-Length allow all
+request_header_access Content-Type allow all
+request_header_access Date allow all
+request_header_access Expires allow all
+request_header_access Host allow all
+request_header_access If-Modified-Since allow all
+request_header_access Last-Modified allow all
+request_header_access Location allow all
+request_header_access Pragma allow all
+request_header_access Accept allow all
+request_header_access Accept-Charset allow all
+request_header_access Accept-Encoding allow all
+request_header_access Accept-Language allow all
+request_header_access Content-Language allow all
+request_header_access Mime-Version allow all
+request_header_access Retry-After allow all
+request_header_access Title allow all
+request_header_access Connection allow all
+request_header_access Proxy-Connection allow all
+request_header_access User-Agent allow all
+request_header_access Cookie allow all
+request_header_access All deny all
+
+8. Lưu lại
+CTRL + X sau đó ấn Y rồi Enter
+
+9. Mở cộng 3128
+sudo firewall-cmd --add-port=3128/tcp --permanent
+
+sudo firewall-cmd --reload
+
+10. Khởi động lại chương trình để các thay đổi có hiệu lực
+sudo systemctl restart squid
+
+
+
