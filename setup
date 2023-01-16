@@ -27,6 +27,8 @@ sudo htpasswd /etc/squid/squid_passwd tamtinhte
 sau đó nhập pass 2 lần, hiện Adding password for user tamtinhte là ok
 
 6. Chỉnh sửa file cấu hình
+* Nếu chưa cài Nano thì chạy lệnh này trước: yum install -y nano
+
 nano /etc/squid/squid.conf
 
 7. Copy đoạn sau đây vào ngay đầu file
