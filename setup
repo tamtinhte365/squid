@@ -13,10 +13,10 @@ sudo yum update && sudo yum upgrade
 reboot
 
 3. Cài Squid vào đi mày
-sudo yum install squid
+sudo yum install squid -y
 
 4. Cài httpd-tools mà tạo user với pass cho proxy
-sudo yum install httpd-tools
+sudo yum install httpd-tools -y
 
 sudo touch /etc/squid/squid_passwd
 
