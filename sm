@@ -1,0 +1,466 @@
+require('dotenv').config();
+const express = require('express');
+const axios = require('axios');
+const mysql = require('mysql2/promise');
+const { normalizePhoneNumber, checkPhoneNumber, countSMSUnits, hasUnicode, logWithTimestamp, truncateString, getNextDevice } = require('./utils/phoneUtils');
+const {
+  isPhoneNumberAndMessageAllowed,
+  phoneNumberExistsInLast24Hours,
+  savePhoneNumber,
+  getUserByApiKey,
+  updateCredits,
+  deductCredits,
+  sendTelegramMessage,
+  getFailedMessages,
+} = require('./utils/apiFunctions');
+const app = express();
+const port = 4000;
+const PRICE_PER_SMS = parseInt(process.env.PRICE_PER_SMS, 10);
+
+const dbConfig = {
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME
+};
+
+app.get('/fetch-and-store', async (req, res) => {
+  const apiKey = req.query.api;
+  
+  if (!apiKey) {
+    res.status(400).json({
+      code: 400,
+      status: 'bad_request',
+      message: 'Thiếu API key'
+    });
+    return;
+  }
+  
+  const user = await getUserByApiKey(apiKey);
+    
+  if (!user) {
+    res.status(400).json({
+      code: 400,
+      status: 'not api_key',
+      message: 'Bạn đã nhập sai API'
+    });
+    return;
+  }
+  
+  const rawPhoneNumber = req.query.phone;
+  const phoneNumber = normalizePhoneNumber(rawPhoneNumber);
+  const checkNumber = checkPhoneNumber(phoneNumber);
+  const encodedMessage = req.query.message;
+  const decodedMessage = decodeURIComponent(encodedMessage);
+
+  const isAllowed = await isPhoneNumberAndMessageAllowed(phoneNumber, decodedMessage);
+  
+  const smsUnit = countSMSUnits(decodedMessage, hasUnicode(decodedMessage));
+  const totalCosts = smsUnit * PRICE_PER_SMS;
+  
+  if (user.credits < totalCosts) {
+    res.status(402).json({
+      code: 402,
+      status: 'insufficient_credits',
+      message: 'Tài khoản của bạn không đủ credits để gửi tin nhắn này'
+    });
+    return;
+  }
+  
+  if (!isAllowed) {
+    const existsInLast24Hours = await phoneNumberExistsInLast24Hours(phoneNumber, decodedMessage);
+    if (existsInLast24Hours) {
+      res.status(200).json({
+        code: 200,
+        phone_number: phoneNumber,
+        status: 'wait_24_hours',
+        message: `Bạn đã yêu cầu gửi SMS tới số điện thoại ${phoneNumber} với nội dung tin nhắn trùng lặp. Vui lòng đợi 24 giờ trước khi tạo yêu cầu mới`
+      });
+      return;
+    } else {
+      res.status(200).json({
+        code: 200,
+        phone_number: phoneNumber,
+        status: 'wait_5_minutes',
+        message: `Bạn đã yêu cầu gửi SMS tới số điện thoại ${phoneNumber} trong vòng 5 phút trước đó. Vui lòng đợi 5 phút trước khi tạo yêu cầu mới`
+      });
+      return;
+    }
+  }
+
+  const numberStatus = checkPhoneNumber(phoneNumber);
+  
+  if (!phoneNumber) {
+    res.status(400).json({
+      code: 400,
+      status: 'not_phone_number',
+      message: 'Không đúng định dạng số điện thoại'
+    });
+    return;
+  }
+  
+  if (smsUnit > 3) {
+    res.status(400).json({
+      code: 400,
+      phone_number: phoneNumber,
+      status: 'message_too_long',
+      message: 'Vượt quá số lượng ký tự cho phép trong 1 tin nhắn'
+    });
+    return;
+  }
+  
+  if (numberStatus === 'not_valid') {
+    res.status(400).json({
+      code: 400,
+      status: 'phone_not_valid',
+      message: 'Số điện thoại không hợp lệ, hãy kiểm tra lại số điện thoại'
+    });
+    return;
+  }
+
+  let responseMessage = '';
+  let responseStatus = '';
+  let smsStatus;
+
+    const totalCost = smsUnit * PRICE_PER_SMS;
+    await deductCredits(apiKey, totalCost); // Chỉ trừ credits khi số điện thoại được lưu thành công và hợp lệ
+    smsStatus = 'Processing';
+    responseMessage = 'Tiếp nhận dữ liệu thành công';
+    responseStatus = numberStatus;
+  
+
+  const success = await savePhoneNumber(phoneNumber, numberStatus, decodedMessage, user.user_name, smsStatus);
+
+  if (success) {
+    res.status(200).json({
+    code: 200,
+    phone_number: phoneNumber,
+    sms_count: smsUnit,
+    status: responseStatus,
+    message: responseMessage
+    });
+  } else {
+    res.status(500).json({
+      code: 500,
+      phone_number: phoneNumber,
+      status: 'error',
+      message: 'Lỗi khi lưu số điện thoại'
+    });
+  }
+});
+
+const handleResponseError = (res, error) => {
+  if (error.code === 500) {
+    res.status(500).json({
+      success: false,
+      data: null,
+      error: {
+        code: 500,
+        message: "This device doesn't exist in database."
+      }
+    });
+  } else {
+    res.status(400).json({
+      success: false,
+      data: null,
+      error: {
+        code: 400,
+        message: 'Bad Request'
+      }
+    });
+  }
+};
+
+async function sendMessage(message, retry = false) {
+  const { check_number, phone_number, sms_message } = message;
+  const device = getNextDevice(check_number);
+
+  if (!device) return;
+
+  const url = `https://sms.tamtinhte.com/services/send.php?key=${process.env.SERVER_API_KEY}&number=${phone_number}&message=${encodeURIComponent(sms_message)}&devices=${device}&type=sms&prioritize=0`;
+  try {
+    const response = await axios.get(url);
+    const smstomtat = truncateString(sms_message,45)
+    const smsId = response.data.data.messages[0].ID;
+    const updatedAt = new Date();
+
+    if (response.data.success) {
+         await updateSmsStatus(message.id, 'Pending', smsId, updatedAt);
+         const logInfoSuccess = `Id ${message.id} từ ${message.username} gửi ${device} tới ${phone_number}.`;
+        logWithTimestamp(logInfoSuccess);
+        await sendTelegramMessage(process.env.TELEGRAM_CHAT_ID, logInfoSuccess);
+    } else {
+      handleResponseError(res, response.data.error);
+    }
+  } catch (error) {
+      
+    if (!retry) {
+        const updatedAt = new Date();
+        const logloikhigui2 = `Id ${message.id} bị lỗi lần 1 khi gửi tới ${device}.`;
+        logWithTimestamp(logloikhigui2);
+        await sendTelegramMessage(process.env.TELEGRAM_CHAT_ID, logloikhigui2);
+        await updateSmsStatus(message.id, 'Gửi bị lỗi', 'Fall 1', updatedAt);
+    } else {
+        const updatedAt = new Date();
+        const logloikhigui = `Id ${message.id} bị lỗi lần 2 khi gửi tới ${device}.`;
+        logWithTimestamp(logloikhigui);
+        await sendTelegramMessage(process.env.TELEGRAM_CHAT_ID, logloikhigui);
+        await updateSmsStatus(message.id, 'Gửi bị lỗi', 'Fall 2', updatedAt);
+    }
+  }
+}
+
+async function getMessagesInLastTwoDays(network) {
+  const connection = await mysql.createConnection(dbConfig);
+  const query = `SELECT * FROM Message WHERE check_number = ? AND sms_status = 'Processing' AND sms_id IS NULL AND created_at >= NOW() - INTERVAL 2 DAY`;
+  try {
+    const [rows] = await connection.execute(query, [network]);
+    connection.end();
+    return rows;
+  } catch (error) {
+    logWithTimestamp(error);
+    connection.end();
+    return [];
+  }
+}
+
+async function updateSmsStatus(messageId, smsStatus, smsId, updatedAt) {
+  const connection = await mysql.createConnection(dbConfig);
+  const query = `UPDATE Message SET sms_status = ?, sms_id = ?, updated_at = ? WHERE id = ?`;
+
+  try {
+    await connection.execute(query, [smsStatus, smsId, updatedAt, messageId]);
+    connection.end();
+  } catch (error) {
+    logWithTimestamp(error);
+    connection.end();
+  }
+}
+
+
+async function processMessagesForNetwork(network) {
+  const messages = await getMessagesInLastTwoDays(network);
+
+  if (messages.length === 0) {
+    return;
+  }
+  const message = messages[0];
+  await sendMessage(message);
+}
+
+processMessagesForNetwork('Viettel');
+processMessagesForNetwork('Vinaphone');
+processMessagesForNetwork('Mobiphone');
+
+// Thiết lập hàm processMessagesForNetwork() được gọi sau mỗi 60 giây cho mỗi nhà mạng
+setInterval(() => processMessagesForNetwork('Viettel'), 60000);
+setInterval(() => processMessagesForNetwork('Vinaphone'), 65000);
+setInterval(() => processMessagesForNetwork('Mobiphone'), 70000);
+
+
+
+let isProcessing = false;
+
+async function retryFailedMessages() {
+  if (isProcessing) {
+    return; // Do not start a new process if the previous process is still running
+  }
+
+  isProcessing = true; // Set the flag to true to indicate that the function is being processed
+  const failedMessages = await getFailedMessages();
+  // Process each message with a delay and wrap it with an immediately invoked function expression (IIFE) to capture the current value of 'i'
+  for (let i = 0; i < failedMessages.length; i++) {
+    setTimeout(async () => {
+      await sendMessage(failedMessages[i], true);
+      if (i === failedMessages.length - 1) {
+        isProcessing = false; // Reset the flag when the last message is processed
+      }
+    }, 10000 * i); // Process each message with a 10-second (10000 ms) delay
+  }
+
+  // If there are no failed messages, reset the flag
+  if (failedMessages.length === 0) {
+    isProcessing = false;
+  }
+}
+
+setInterval(retryFailedMessages, 60000);
+
+
+
+async function refundFailedMessages() {
+  const connection = await mysql.createConnection(dbConfig);
+  // Query messages with 'sms_id' = 'Fall 2' in the last 2 days
+  const queryMessages = `
+    SELECT *
+    FROM Message
+    WHERE sms_id = 'Fall 2' AND created_at >= NOW() - INTERVAL 2 DAY
+  `;
+  const [failedMessages] = await connection.execute(queryMessages);
+  // Loop through the failed messages and update the credits for each user
+  for (const message of failedMessages) {
+    const { id, username, sms_count } = message;
+    // Find the corresponding user in the 'User' table
+    const queryUser = `
+      SELECT *
+      FROM User
+      WHERE user_name = ?
+    `;
+    const [userRows] = await connection.execute(queryUser, [username]);
+    // Update the 'credits' for the user
+    if (userRows.length > 0) {
+      const user = userRows[0];
+      const refundAmount = sms_count * PRICE_PER_SMS;
+      const updatedCredits = user.credits + refundAmount;
+      const queryUpdateCredits = `
+        UPDATE User
+        SET credits = ?
+        WHERE user_name = ?
+      `;
+      await connection.execute(queryUpdateCredits, [updatedCredits, username]);
+      // Update the 'sms_id' to 'Refund'
+      const queryUpdateSmsId = `
+        UPDATE Message
+        SET sms_id = 'Refund'
+        WHERE id = ?
+      `;
+      await connection.execute(queryUpdateSmsId, [id]);
+      logWithTimestamp(`Đã hoàn ${refundAmount} cho id ${id}`);
+    }
+  }
+  connection.end();
+}
+
+// Call the function periodically
+setInterval(refundFailedMessages, 30000);
+
+
+
+
+async function checkPendingMessages() {
+  const connection = await mysql.createConnection(dbConfig);
+
+  // Get the pending messages from the last 2 days
+  const [pendingMessages] = await connection.execute(
+    `SELECT * FROM Message WHERE sms_status = 'Pending' AND updated_at >= NOW() - INTERVAL 2 DAY AND updated_at <= NOW() - INTERVAL 10 MINUTE`
+  );
+
+  // Loop through the pending messages and check their status
+  for (const message of pendingMessages) {
+    const { id, sms_id } = message;
+
+    try {
+      const response = await axios.get(`https://sms.tamtinhte.com/checkinfo.php?id=${sms_id}`);
+      const { status } = response.data;
+
+      let updatedStatus;
+      if (status === 'Sent') {
+        updatedStatus = 'Sent';
+        logWithTimestamp(`Đã gửi thành công id ${id}!`);
+      } else if (status === 'Pending') {
+        updatedStatus = 'reCheck';
+      } else {
+        continue;
+      }
+
+      // Update the 'sms_status' and 'updated_at' columns in the database
+      await connection.execute(
+        `UPDATE Message SET sms_status = ?, updated_at = NOW() WHERE id = ?`,
+        [updatedStatus, id]
+      );
+    } catch (error) {
+      logWithTimestamp(`Error checking status for message ID ${id}: ${error.message}`);
+    }
+  }
+
+  // Close the connection
+  await connection.end();
+}
+
+// Run the 'checkPendingMessages' function every minute
+setInterval(checkPendingMessages, 60000);
+
+
+async function checkPendingMessages2() {
+  const connection = await mysql.createConnection(dbConfig);
+
+  // Get the pending messages from the last 2 days
+  const [pendingMessages] = await connection.execute(
+    `SELECT * FROM Message WHERE sms_status = 'reCheck' AND updated_at >= NOW() - INTERVAL 1 DAY AND updated_at <= NOW() - INTERVAL 30 MINUTE`
+  );
+
+  // Loop through the pending messages and check their status
+  for (const message of pendingMessages) {
+    const { id, sms_id, username, sms_count } = message;
+
+    try {
+      const response = await axios.get(`https://sms.tamtinhte.com/checkinfo.php?id=${sms_id}`);
+      const { status } = response.data;
+
+      let updatedStatus;
+      if (status === 'Sent') {
+        updatedStatus = 'Sent';
+        logWithTimestamp(`Đã gửi thành công id ${id}!`);
+      } else if (status === 'Pending') {
+        updatedStatus = 'Refund';
+
+        // Send delete request
+        const deleteResponse = await axios.get(`https://sms.tamtinhte.com/checkinfo.php?deleteid=${sms_id}`);
+        const deleteStatus = deleteResponse.data.status;
+
+        if (deleteStatus === 'deleted') {
+          // Get user's current credits
+          const [userResult] = await connection.execute(
+            `SELECT credits FROM User WHERE user_name = ?`,
+            [username]
+          );
+
+          const currentCredits = userResult[0].credits;
+
+          // Add the refund amount to the user's credits
+          const refundAmount = sms_count * PRICE_PER_SMS;
+          const newCredits = currentCredits + refundAmount;
+
+          // Update user's credits
+          await connection.execute(
+            `UPDATE User SET credits = ? WHERE user_name = ?`,
+            [newCredits, username]
+          );
+          
+          logWithTimestamp(`Hoàn lại cho ${id} vì pedding 30 phút vẫn chưa gửi đi được ${sms_id}`);
+        }
+      } else if (status === 'not_found') {
+        logWithTimestamp(`Message ID ${id} không tìm thấy: ${status}`);
+        // Handle 'not_found' status if needed, e.g., update the message status or log a warning
+      } else {
+        logWithTimestamp(`Unknown status for message ID ${id}`);
+        continue;
+      }
+
+      // Update the 'sms_status' and 'updated_at' columns in the database
+      await connection.execute(
+        `UPDATE Message SET sms_status = ?, updated_at = NOW() WHERE id = ?`,
+        [updatedStatus, id]
+      );
+    } catch (error) {
+      logWithTimestamp(`Error checking status for message ID ${id}: ${error.message}`);
+    }
+  }
+
+  // Close the connection
+  await connection.end();
+}
+
+// Run the 'checkPendingMessages2' function every 2 minutes
+setInterval(checkPendingMessages2, 120000);
+
+
+
+
+
+
+app.listen(port, () => {
+
+});
+
+
